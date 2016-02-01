@@ -1,0 +1,135 @@
+#cloud-config
+
+---
+write_files:
+- path: /tmp/ceph_populate_kv.sh
+  permissions: '0744'
+  owner: root
+  content: |
+    #!/bin/bash
+
+    etcdctl get /ceph-populated &> /dev/null
+    RESULT=$?
+
+    if [ $RESULT -eq 0 ]; then
+      echo "Already populated"
+    else
+      etcdctl set /ceph-populated "true" &> /dev/null
+      docker run -d --net=host \
+        -v /etc/ceph:/etc/ceph \
+        -v /var/lib/ceph/:/var/lib/ceph/ \
+        -e MON_IP=$public_ipv4 \
+        -e CEPH_PUBLIC_NETWORK=172.17.8.0/24 \
+        -e KV_TYPE=etcd \
+        -e KV_IP=$public_ipv4 \
+        -e KV_PORT=4001 \
+        ceph/daemon populate_kvstore
+    fi
+coreos:
+  etcd2:
+    discovery: https://discovery.etcd.io/e23f04cc7be4f8eb8c9b25d3e86a884b
+    advertise-client-urls: http://$public_ipv4:2379
+    initial-advertise-peer-urls: http://$private_ipv4:2380
+    listen-client-urls: http://0.0.0.0:2379,http://0.0.0.0:4001
+    listen-peer-urls: http://$private_ipv4:2380,http://$private_ipv4:7001
+  fleet:
+    public-ip: $public_ipv4
+  flannel:
+    interface: $public_ipv4
+  units:
+  - name: etcd2.service
+    command: start
+  - name: fleet.service
+    command: start
+  - name: flanneld.service
+    drop-ins:
+    - name: 50-network-config.conf
+      content: |
+        [Service]
+        ExecStartPre=/usr/bin/etcdctl set /coreos.com/network/config '{ "Network": "10.1.0.0/16" }'
+    command: start
+  - name: docker-tcp.socket
+    command: start
+    enable: true
+    content: |
+      [Unit]
+      Description=Docker Socket for the API
+
+      [Socket]
+      ListenStream=2375
+      Service=docker.service
+      BindIPv6Only=both
+
+      [Install]
+      WantedBy=sockets.target
+  - name: format-var-lib-data-ceph.service
+    command: start
+    content: |
+      [Unit]
+      Before=var-lib-data-drive.mount
+      ConditionPathExists=!/var/lib/data/ceph-fs.btrfs
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/bin/mkdir -p /var/lib/data/drive
+      ExecStart=/usr/bin/touch /var/lib/data/ceph-fs.btrfs
+      ExecStart=/usr/bin/truncate --size=1G /var/lib/data/ceph-fs.btrfs
+      ExecStart=/usr/sbin/mkfs.btrfs /var/lib/data/ceph-fs.btrfs
+  - name: var-lib-data-drive.mount
+    enable: true
+    command: start
+    content: |
+      [Unit]
+      Before=docker.service
+      After=format-var-lib-data-ceph.service
+      Requires=format-var-lib-data-ceph.service
+      [Install]
+      RequiredBy=docker.service
+      [Mount]
+      What=/var/lib/data/ceph-fs.btrfs
+      Where=/var/lib/data/drive
+      Type=btrfs
+      Options=loop,discard
+  - name: prepare-ceph.service
+    command: start
+    content: |
+      [Unit]
+      After=etcd2.service docker-tcp.socket
+      Before=var-lib-data-drive.mount
+      [Service]
+      Type=oneshot
+      ExecStartPre=/usr/bin/docker pull ceph/daemon
+      ExecStart=/usr/bin/mkdir -p /etc/ceph
+      ExecStart=/usr/bin/mkdir -p /var/lib/ceph
+      ExecStart=/usr/bin/mkdir -p /var/run/ceph
+      ExecStart=/usr/bin/chown -R 64045:64045 /var/run/ceph
+      ExecStart=/usr/bin/sh -c "/tmp/ceph_populate_kv.sh"
+  - name: ceph-mon.service
+    command: start
+    enable: true
+    content: |-
+      [Unit]
+      Description=Ceph MON
+      After=prepare-ceph.service
+      Requires=prepare-ceph.service
+
+      [Service]
+      Restart=always
+      RestartSec=20
+      TimeoutStartSec=5
+      ExecStartPre=-/usr/bin/docker kill ceph_mon
+      ExecStartPre=-/usr/bin/docker rm ceph_mon
+      ExecStartPre=/usr/bin/docker pull ceph/daemon
+      ExecStart=/usr/bin/sh -c "docker run -d --name ceph_mon --net=host \
+        -v /etc/ceph:/etc/ceph \
+        -v /var/lib/ceph:/var/lib/ceph \
+        -v /var/run/ceph:/var/run/ceph \
+        -e MON_IP=$public_ipv4 \
+        -e CEPH_PUBLIC_NETWORK=172.17.8.0/24 \
+        -e KV_TYPE=etcd \
+        -e KV_IP=$public_ipv4 \
+        -e KV_PORT=4001 \
+        ceph/daemon mon"
+      ExecStop=/usr/bin/docker stop ceph_mon
+
+      [Install]
+      WantedBy=multi-user.target
